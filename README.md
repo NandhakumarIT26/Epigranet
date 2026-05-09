@@ -4,6 +4,9 @@ EpigraNet-Tamil is a Flask-based OCR application for recognizing Tamil epigraphi
 
 The application provides a browser UI for uploading inscription images, viewing each pipeline stage, checking confidence scores, and exporting the final OCR result as `TXT`, `CSV`, or `JSON`.
 
+Hosted Link: [https://epigranet.onrender.com/](https://epigranet.onrender.com/)
+
+
 ## Features
 
 - Upload inscription images through a simple web interface
