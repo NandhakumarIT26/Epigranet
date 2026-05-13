@@ -19,6 +19,7 @@ from torchvision import models, transforms
 IMAGE_SIZE = 64
 EMBED_DIM = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+REFERENCE_EMBEDDING_VERSION = 1
 
 
 def ensure_dir(path: Path) -> Path:
@@ -203,10 +204,17 @@ class PredictionResult:
 
 
 class OCRPredictor:
-    def __init__(self, model_path: Path, dataset_path: Path, class_mapping_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        class_mapping_path: Optional[Path] = None,
+        embedding_cache_path: Optional[Path] = None,
+        dataset_path: Optional[Path] = None,
+    ) -> None:
         self.model_path = model_path
         self.dataset_path = dataset_path
         self.class_mapping_path = class_mapping_path
+        self.embedding_cache_path = embedding_cache_path
         self.model = EmbeddingNet().to(DEVICE)
         self.transform = transforms.Compose(
             [
@@ -222,27 +230,25 @@ class OCRPredictor:
     def _load(self) -> None:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
-        if not self.dataset_path.exists():
-            raise FileNotFoundError(f"Reference dataset not found: {self.dataset_path}")
 
         state_dict = torch.load(str(self.model_path), map_location=DEVICE)
         self.model.load_state_dict(state_dict)
         self.model.eval()
-
-        classes = sorted(os.listdir(self.dataset_path))
-        for cls in classes:
-            class_path = self.dataset_path / cls
-            if not class_path.is_dir():
-                continue
-            images = [p for p in class_path.iterdir() if p.is_file()]
-            if not images:
-                continue
-            emb = self._embed_image(images[0])
-            self.reference_embeddings[cls] = emb
-
-        if not self.reference_embeddings:
-            raise RuntimeError("No reference embeddings could be built from the dataset folder.")
         self.class_mapping = self._load_class_mapping()
+
+        if self.embedding_cache_path and self.embedding_cache_path.exists():
+            self.reference_embeddings = self._load_reference_embeddings_from_cache(self.embedding_cache_path)
+            return
+
+        if not self.dataset_path or not self.dataset_path.exists():
+            cache_hint = f" or embedding cache not found: {self.embedding_cache_path}" if self.embedding_cache_path else ""
+            raise FileNotFoundError(
+                f"Reference dataset not found: {self.dataset_path}{cache_hint}"
+            )
+
+        self.reference_embeddings = self._build_reference_embeddings_from_dataset(self.dataset_path)
+        if self.embedding_cache_path:
+            self._save_reference_embeddings_cache(self.embedding_cache_path, self.reference_embeddings)
 
     def _load_class_mapping(self) -> Dict[str, str]:
         if not self.class_mapping_path:
@@ -254,6 +260,59 @@ class OCRPredictor:
         if not isinstance(data, dict):
             raise ValueError("Class mapping file must contain a JSON object.")
         return {str(key): str(value) for key, value in data.items()}
+
+    def _build_reference_embeddings_from_dataset(self, dataset_path: Path) -> Dict[str, torch.Tensor]:
+        reference_embeddings: Dict[str, torch.Tensor] = {}
+        classes = sorted(os.listdir(dataset_path))
+        for cls in classes:
+            class_path = dataset_path / cls
+            if not class_path.is_dir():
+                continue
+            images = sorted(p for p in class_path.iterdir() if p.is_file())
+            if not images:
+                continue
+            # Preserve the original app behavior by using one representative sample per class.
+            emb = self._embed_image(images[0])
+            reference_embeddings[cls] = emb
+
+        if not reference_embeddings:
+            raise RuntimeError("No reference embeddings could be built from the dataset folder.")
+        return reference_embeddings
+
+    def _save_reference_embeddings_cache(
+        self,
+        cache_path: Path,
+        reference_embeddings: Dict[str, torch.Tensor],
+    ) -> None:
+        ensure_dir(cache_path.parent)
+        serializable_embeddings = {
+            cls: emb.detach().cpu().squeeze(0) for cls, emb in reference_embeddings.items()
+        }
+        torch.save(
+            {
+                "version": REFERENCE_EMBEDDING_VERSION,
+                "embedding_dim": EMBED_DIM,
+                "reference_embeddings": serializable_embeddings,
+            },
+            str(cache_path),
+        )
+
+    def _load_reference_embeddings_from_cache(self, cache_path: Path) -> Dict[str, torch.Tensor]:
+        payload = torch.load(str(cache_path), map_location=DEVICE)
+        if not isinstance(payload, dict):
+            raise ValueError("Reference embedding cache must contain a dictionary payload.")
+
+        raw_embeddings = payload.get("reference_embeddings")
+        if not isinstance(raw_embeddings, dict) or not raw_embeddings:
+            raise ValueError("Reference embedding cache does not contain any saved embeddings.")
+
+        reference_embeddings: Dict[str, torch.Tensor] = {}
+        for cls, emb in raw_embeddings.items():
+            tensor = emb if isinstance(emb, torch.Tensor) else torch.tensor(emb, dtype=torch.float32)
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            reference_embeddings[str(cls)] = F.normalize(tensor.to(DEVICE), p=2, dim=1)
+        return reference_embeddings
 
     def _map_label(self, label: str) -> str:
         return self.class_mapping.get(label, label)
@@ -291,3 +350,14 @@ class OCRPredictor:
 
 def create_run_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def build_reference_embedding_cache(model_path: Path, dataset_path: Path, output_path: Path) -> Path:
+    predictor = OCRPredictor(
+        model_path=model_path,
+        dataset_path=dataset_path,
+        embedding_cache_path=output_path,
+    )
+    if not output_path.exists():
+        raise RuntimeError(f"Failed to create reference embedding cache at: {output_path}")
+    return output_path

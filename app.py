@@ -15,7 +15,7 @@ from pipeline import (
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-GENERATED_DIR = ensure_dir(STATIC_DIR / "generated")
+GENERATED_DIR = ensure_dir(Path(os.environ.get("EPIGRANET_GENERATED_DIR", BASE_DIR / "runtime_generated")))
 UPLOAD_DIR = ensure_dir(GENERATED_DIR / "uploads")
 PREPROCESSED_DIR = ensure_dir(GENERATED_DIR / "preprocessed")
 SEGMENT_DIR = ensure_dir(GENERATED_DIR / "segments")
@@ -25,6 +25,9 @@ ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp", "webp"}
 MAX_FILE_SIZE_MB = 20
 
 MODEL_PATH = Path(os.environ.get("EPIGRANET_MODEL_PATH", BASE_DIR / "models" / "epigranet_embedding_model (1).pt"))
+EMBEDDINGS_PATH = Path(
+    os.environ.get("EPIGRANET_EMBEDDINGS_PATH", BASE_DIR / "models" / "reference_embeddings.pt")
+)
 DATASET_PATH = Path(os.environ.get("EPIGRANET_DATASET_PATH", BASE_DIR / "aug_dataset"))
 CLASS_MAPPING_PATH = Path(os.environ.get("EPIGRANET_CLASS_MAPPING_PATH", BASE_DIR / "class_mapping_209 (1).json"))
 
@@ -38,7 +41,12 @@ _predictor = None
 def get_predictor() -> OCRPredictor:
     global _predictor
     if _predictor is None:
-        _predictor = OCRPredictor(MODEL_PATH, DATASET_PATH, CLASS_MAPPING_PATH)
+        _predictor = OCRPredictor(
+            model_path=MODEL_PATH,
+            class_mapping_path=CLASS_MAPPING_PATH,
+            embedding_cache_path=EMBEDDINGS_PATH,
+            dataset_path=DATASET_PATH if DATASET_PATH.exists() else None,
+        )
     return _predictor
 
 
@@ -46,9 +54,9 @@ def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def to_static_url(path: Path) -> str:
-    rel = path.relative_to(STATIC_DIR).as_posix()
-    return f"/static/{rel}"
+def to_generated_url(path: Path) -> str:
+    rel = path.relative_to(GENERATED_DIR).as_posix()
+    return f"/generated/{rel}"
 
 
 @app.route("/")
@@ -126,9 +134,9 @@ def predict():
             "recognized_text": recognized_text,
             "confidence": confidence,
             "num_segments": num_segments,
-            "original_image": to_static_url(upload_path),
-            "preprocessed_image": to_static_url(preprocessed_path),
-            "segmented_overlay_image": to_static_url(boxed_path),
+            "original_image": to_generated_url(upload_path),
+            "preprocessed_image": to_generated_url(preprocessed_path),
+            "segmented_overlay_image": to_generated_url(boxed_path),
             "token_predictions": token_predictions,
             "pipeline_status": pipeline_status,
             "warning": warning,
