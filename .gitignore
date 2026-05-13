@@ -2,3 +2,7 @@ aug_dataset/
 runtime_generated/
 __pycache__/
 *.pyc
+static/generated/
+runtime_generated/
+__pycache__/
+*.pyc
