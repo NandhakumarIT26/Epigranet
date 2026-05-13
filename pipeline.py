@@ -5,14 +5,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Keep native libraries on a single thread for low-memory cloud instances.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import cv2
-import imutils
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage import interpolation as inter
 from torchvision import models, transforms
 
 
@@ -21,15 +25,35 @@ EMBED_DIM = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 REFERENCE_EMBEDDING_VERSION = 1
 
+try:
+    torch.set_num_threads(int(os.environ.get("EPIGRANET_TORCH_THREADS", "1")))
+    torch.set_num_interop_threads(int(os.environ.get("EPIGRANET_TORCH_INTEROP_THREADS", "1")))
+except RuntimeError:
+    # Thread counts can only be set before work starts; ignore if already initialized.
+    pass
+
 
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
+def rotate_nearest(image: np.ndarray, angle: float) -> np.ndarray:
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 def correct_skew(image: np.ndarray, delta: int = 1, limit: int = 5) -> Tuple[float, np.ndarray]:
     def determine_score(arr: np.ndarray, angle: float) -> Tuple[np.ndarray, float]:
-        data = inter.rotate(arr, angle, reshape=False, order=0)
+        data = rotate_nearest(arr, angle)
         histogram = np.sum(data, axis=1)
         score = np.sum((histogram[1:] - histogram[:-1]) ** 2)
         return histogram, float(score)
@@ -163,7 +187,7 @@ def segment_characters(
     dilate = cv2.dilate(thresh, None, iterations=2)
 
     cnts_raw = cv2.findContours(dilate.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnts = imutils.grab_contours(cnts_raw)
+    cnts = cnts_raw[0] if len(cnts_raw) == 2 else cnts_raw[1]
     sorted_ctrs = sorted(
         cnts,
         key=lambda ctr: cv2.boundingRect(ctr)[0] + cv2.boundingRect(ctr)[1] * image.shape[1],
@@ -320,7 +344,7 @@ class OCRPredictor:
     def _embed_image(self, image_path: Path) -> torch.Tensor:
         img = Image.open(image_path).convert("RGB")
         tensor = self.transform(img).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
+        with torch.inference_mode():
             emb = self.model(tensor)
         return emb
 

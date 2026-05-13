@@ -1,8 +1,6 @@
 flask
 opencv-python
 numpy
-scipy
-imutils
 torch
 torchvision
 pillow

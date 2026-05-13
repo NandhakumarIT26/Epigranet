@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
@@ -36,18 +37,50 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE_MB * 1024 * 1024
 app.config["JSON_AS_ASCII"] = False
 
 _predictor = None
+_predictor_lock = threading.Lock()
+_predictor_warmup_started = False
+_predictor_warmup_error = None
 
 
 def get_predictor() -> OCRPredictor:
-    global _predictor
-    if _predictor is None:
-        _predictor = OCRPredictor(
-            model_path=MODEL_PATH,
-            class_mapping_path=CLASS_MAPPING_PATH,
-            embedding_cache_path=EMBEDDINGS_PATH,
-            dataset_path=DATASET_PATH if DATASET_PATH.exists() else None,
-        )
+    global _predictor, _predictor_warmup_error
+    if _predictor is not None:
+        return _predictor
+
+    with _predictor_lock:
+        if _predictor is not None:
+            return _predictor
+        if _predictor_warmup_error is not None:
+            raise RuntimeError(f"Predictor warmup failed: {_predictor_warmup_error}")
+
+        try:
+            _predictor = OCRPredictor(
+                model_path=MODEL_PATH,
+                class_mapping_path=CLASS_MAPPING_PATH,
+                embedding_cache_path=EMBEDDINGS_PATH,
+                dataset_path=DATASET_PATH if DATASET_PATH.exists() else None,
+            )
+        except Exception as exc:
+            _predictor_warmup_error = exc
+            raise
     return _predictor
+
+
+def start_predictor_warmup() -> None:
+    global _predictor_warmup_started
+    if _predictor_warmup_started:
+        return
+
+    _predictor_warmup_started = True
+
+    def _warmup() -> None:
+        try:
+            get_predictor()
+        except Exception:
+            # The request path will surface the detailed error if warmup fails.
+            pass
+
+    threading.Thread(target=_warmup, name="predictor-warmup", daemon=True).start()
 
 
 def allowed_file(filename: str) -> bool:
@@ -61,6 +94,7 @@ def to_generated_url(path: Path) -> str:
 
 @app.route("/")
 def index():
+    start_predictor_warmup()
     return render_template("index.html", max_size_mb=MAX_FILE_SIZE_MB)
 
 
@@ -147,6 +181,9 @@ def predict():
 @app.route("/generated/<path:filename>")
 def generated(filename: str):
     return send_from_directory(GENERATED_DIR, filename)
+
+
+start_predictor_warmup()
 
 
 if __name__ == "__main__":
