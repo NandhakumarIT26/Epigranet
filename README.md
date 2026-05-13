@@ -6,10 +6,7 @@ The application provides a browser UI for uploading inscription images, viewing 
 
 Hosted Link: [https://epigranet.onrender.com/](https://epigranet.onrender.com/)
 
-<<<<<<< HEAD
-=======
 
->>>>>>> a83ef86f2a5f901618c07c88cd486c7754a34e98
 ## Features
 
 - Upload inscription images through a simple web interface
