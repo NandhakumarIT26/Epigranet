@@ -1,4 +1,6 @@
+import html
 import json
+import mimetypes
 import os
 import uuid
 from io import BytesIO
@@ -26,6 +28,7 @@ DEFAULT_DATASET_PATH = BASE_DIR / "aug_dataset"
 
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp", "webp"}
 MAX_FILE_SIZE_MB = 20
+ORDERED_STAGES = ["preprocessing", "segmentation", "prediction", "mapping", "result"]
 
 
 def create_run_id() -> str:
@@ -53,6 +56,21 @@ def get_asset_settings() -> Dict[str, Optional[str]]:
         "class_mapping_path": os.environ.get("EPIGRANET_CLASS_MAPPING_PATH", str(DEFAULT_CLASS_MAPPING_PATH)),
         "dataset_path": os.environ.get("EPIGRANET_DATASET_PATH", str(DEFAULT_DATASET_PATH)),
     }
+
+
+def normalize_stage(status_text: str) -> Optional[str]:
+    text = (status_text or "").lower()
+    if "preprocess" in text:
+        return "preprocessing"
+    if "segment" in text:
+        return "segmentation"
+    if "predict" in text:
+        return "prediction"
+    if "map" in text:
+        return "mapping"
+    if "result" in text or "recogniz" in text:
+        return "result"
+    return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -127,12 +145,24 @@ def run_ocr(uploaded_file) -> Dict[str, object]:
 
     upload_path.write_bytes(file_bytes)
 
+    pipeline_status = ["Image uploaded successfully."]
+    warning = None
+
     preprocess_image(upload_path, preprocessed_path)
-    roi_paths = segment_characters(preprocessed_path, roi_dir, boxed_path)
+    pipeline_status.append("Preprocessing completed.")
+
+    try:
+        roi_paths = segment_characters(preprocessed_path, roi_dir, boxed_path)
+        pipeline_status.append("Segmentation completed.")
+    except Exception as exc:
+        roi_paths = []
+        warning = f"Segmentation skipped: {exc}"
+        pipeline_status.append(warning)
 
     predictor = load_predictor(get_asset_settings())
     result = predictor.predict_text(roi_paths, preprocessed_path)
     segments_used = len(roi_paths) if roi_paths else len(result.tokens)
+    pipeline_status.append("OCR prediction completed.")
 
     payload = {
         "run_id": run_id,
@@ -144,6 +174,8 @@ def run_ocr(uploaded_file) -> Dict[str, object]:
         "preprocessed_image": preprocessed_path,
         "segmented_overlay_image": boxed_path if boxed_path.exists() else preprocessed_path,
         "roi_paths": roi_paths,
+        "pipeline_status": pipeline_status,
+        "warning": warning,
     }
     return payload
 
@@ -169,24 +201,571 @@ def render_downloads(result: Dict[str, object]) -> None:
     st.download_button("Download CSV", data=csv_payload, file_name=f"{result['run_id']}.csv")
 
 
+def inject_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Noto+Sans+Tamil:wght@400;700&display=swap');
+
+        :root {
+          --bg: #f3f4f9;
+          --panel: #ffffff;
+          --ink: #1b1f2a;
+          --muted: #586178;
+          --accent: #41766f;
+          --accent-strong: #2f5d57;
+          --line: #dbe0ea;
+          --danger: #be2f4d;
+        }
+
+        html, body, [class*="css"]  {
+          font-family: "Manrope", sans-serif;
+        }
+
+        [data-testid="stAppViewContainer"] {
+          background:
+            radial-gradient(circle at top left, rgba(119, 140, 255, 0.14), transparent 34%),
+            radial-gradient(circle at top right, rgba(29, 99, 135, 0.12), transparent 38%),
+            var(--bg);
+        }
+
+        [data-testid="stHeader"] {
+          background: transparent;
+        }
+
+        #MainMenu, footer {
+          visibility: hidden;
+        }
+
+        .block-container {
+          max-width: 1320px;
+          padding-top: 28px;
+          padding-bottom: 28px;
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+
+        .topbar {
+          background: linear-gradient(120deg, #454d67, #2f3852);
+          color: #fff;
+          border-radius: 14px 14px 0 0;
+          padding: 20px 28px;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 0;
+        }
+
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .brand h1 {
+          margin: 0;
+          font-size: 34px;
+          font-weight: 800;
+          line-height: 1.15;
+          color: #fff;
+        }
+
+        .brand-icon {
+          width: 38px;
+          height: 38px;
+          border-radius: 10px;
+          display: grid;
+          place-items: center;
+          background: rgba(255, 255, 255, 0.2);
+          font-size: 22px;
+        }
+
+        .actions {
+          font-size: 20px;
+          opacity: 0.95;
+        }
+
+        .shell {
+          background: var(--panel);
+          border: 1px solid var(--line);
+          padding: 20px;
+        }
+
+        .shell-bottom {
+          border-radius: 0 0 14px 14px;
+          margin-bottom: 20px;
+        }
+
+        .upload-copy {
+          margin-bottom: 12px;
+        }
+
+        .drop-main {
+          margin: 0;
+          font-size: 28px;
+          color: var(--ink);
+        }
+
+        .drop-sub, .selected-file {
+          margin: 6px 0 0;
+          color: var(--muted);
+          font-size: 18px;
+        }
+
+        .pipeline-stage {
+          margin-top: 20px;
+          padding: 20px;
+          border-radius: 12px;
+          border: 1px solid #cad6ee;
+          background: linear-gradient(160deg, #f6f9ff, #ecf2ff);
+          box-shadow: 0 10px 20px rgba(43, 70, 130, 0.08);
+        }
+
+        .pipeline-head {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 14px;
+        }
+
+        .pipeline-head h2, .card h2, .results-headline {
+          margin: 0 0 12px;
+          color: var(--ink);
+        }
+
+        .pipeline-stage-label {
+          margin: 0;
+          color: #39537b;
+          font-size: 17px;
+          font-weight: 700;
+        }
+
+        .pipeline-flow {
+          margin: 0;
+          padding: 0;
+          list-style: none;
+          display: grid;
+          grid-template-columns: repeat(5, minmax(0, 1fr));
+          gap: 14px;
+        }
+
+        .pipeline-step {
+          position: relative;
+          min-height: 88px;
+          border: 1px solid #c3cee5;
+          border-radius: 12px;
+          background: #fff;
+          display: grid;
+          justify-items: center;
+          align-content: center;
+          gap: 8px;
+          padding: 10px 8px;
+          text-align: center;
+        }
+
+        .pipeline-step::after {
+          content: ">";
+          position: absolute;
+          right: -12px;
+          top: 50%;
+          transform: translateY(-50%);
+          color: #8092b9;
+          font-size: 22px;
+          font-weight: 800;
+        }
+
+        .pipeline-step:last-child::after {
+          display: none;
+        }
+
+        .step-index {
+          width: 34px;
+          height: 34px;
+          border-radius: 50%;
+          display: grid;
+          place-items: center;
+          font-weight: 800;
+          color: #4f607f;
+          background: #e8eefb;
+        }
+
+        .step-label {
+          font-size: 18px;
+          font-weight: 700;
+          color: #2a3550;
+        }
+
+        .pipeline-step.current {
+          border-color: #3d6ca8;
+          box-shadow: 0 8px 18px rgba(46, 103, 173, 0.25);
+          transform: translateY(-2px);
+        }
+
+        .pipeline-step.current .step-index {
+          background: #3d6ca8;
+          color: #fff;
+        }
+
+        .pipeline-step.done {
+          border-color: #4b8a69;
+          background: #eff9f4;
+        }
+
+        .pipeline-step.done .step-index {
+          background: #4b8a69;
+          color: #fff;
+        }
+
+        .card {
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          padding: 16px;
+          background: #fff;
+        }
+
+        .image-wrap {
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          min-height: 220px;
+          background: #f6f8fc;
+          overflow: hidden;
+          display: grid;
+          place-items: center;
+        }
+
+        .image-wrap img {
+          width: 100%;
+          display: block;
+          object-fit: contain;
+          max-height: 420px;
+        }
+
+        .image-wrap.empty::before {
+          content: "Waiting for image";
+          color: var(--muted);
+          font-size: 18px;
+        }
+
+        .results-card {
+          margin-top: 20px;
+          border-radius: 0 0 14px 14px;
+        }
+
+        .recognized {
+          margin-top: 14px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          background: #f8fafc;
+          min-height: 72px;
+          padding: 12px 16px;
+          font-size: 44px;
+          font-weight: 700;
+          line-height: 1.35;
+          max-width: 100%;
+          white-space: normal;
+          overflow-wrap: anywhere;
+          word-break: break-word;
+          hyphens: auto;
+        }
+
+        .tamil {
+          font-family: "Noto Sans Tamil", "Manrope", sans-serif;
+        }
+
+        .metrics {
+          display: flex;
+          gap: 26px;
+          color: #313747;
+          font-size: 20px;
+          margin: 14px 0;
+        }
+
+        .status-list {
+          margin: 8px 0 0;
+          padding-left: 18px;
+          color: #2f6a59;
+          font-size: 18px;
+        }
+
+        .error-text {
+          color: var(--danger);
+          font-weight: 700;
+          margin-top: 12px;
+        }
+
+        div[data-testid="stFileUploader"] > label,
+        div[data-testid="stMarkdownContainer"] p {
+          font-family: "Manrope", sans-serif;
+        }
+
+        section[data-testid="stFileUploaderDropzone"] {
+          border: 2px dashed #c7cfde;
+          border-radius: 12px;
+          padding: 18px;
+          background: linear-gradient(180deg, #f8faff, #f1f5fb);
+        }
+
+        section[data-testid="stFileUploaderDropzone"]:hover {
+          border-color: var(--accent);
+          background: #edf7f5;
+        }
+
+        [data-testid="stFileUploaderDropzoneInstructions"] div {
+          color: var(--muted);
+        }
+
+        div[data-testid="stButton"] > button,
+        div[data-testid="stDownloadButton"] > button {
+          border: 1px solid transparent;
+          border-radius: 10px;
+          padding: 10px 18px;
+          font: inherit;
+          font-size: 20px;
+          cursor: pointer;
+          width: 100%;
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"] {
+          background: var(--accent);
+          color: #fff;
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"]:hover {
+          background: var(--accent-strong);
+          border-color: var(--accent-strong);
+          color: #fff;
+        }
+
+        div[data-testid="stButton"] > button[kind="secondary"] {
+          background: #fff;
+          border-color: #bcc7de;
+          color: var(--ink);
+        }
+
+        div[data-testid="stDownloadButton"] > button {
+          background: #3d6ca8;
+          color: #fff;
+        }
+
+        div[data-testid="stSelectbox"] label,
+        div[data-testid="stDataFrame"] {
+          font-family: "Manrope", sans-serif;
+        }
+
+        @media (max-width: 980px) {
+          .topbar {
+            border-radius: 14px;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 14px;
+          }
+
+          .brand h1 {
+            font-size: 24px;
+          }
+
+          .drop-main {
+            font-size: 22px;
+          }
+
+          .pipeline-head {
+            flex-direction: column;
+            align-items: flex-start;
+          }
+
+          .pipeline-flow {
+            grid-template-columns: 1fr;
+          }
+
+          .pipeline-step::after {
+            content: "v";
+            right: 50%;
+            top: auto;
+            bottom: -14px;
+            transform: translateX(50%);
+          }
+
+          .recognized {
+            font-size: 30px;
+          }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def path_to_data_uri(path: Optional[Path]) -> Optional[str]:
+    if path is None or not path.exists():
+        return None
+    mime_type, _ = mimetypes.guess_type(str(path))
+    mime_type = mime_type or "image/png"
+    data = path.read_bytes()
+    import base64
+
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def image_to_data_uri(image: Image.Image) -> str:
+    import base64
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
+
+
+def render_preview_card(title: str, image_uri: Optional[str], alt: str) -> None:
+    image_markup = (
+        f'<img src="{image_uri}" alt="{html.escape(alt)}">' if image_uri else ""
+    )
+    empty_class = " empty" if image_uri is None else ""
+    st.markdown(
+        f"""
+        <article class="card">
+          <h2>{html.escape(title)}</h2>
+          <div class="image-wrap{empty_class}">
+            {image_markup}
+          </div>
+        </article>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_pipeline_markup(status_items: List[str], fallback_current: Optional[str] = None) -> str:
+    seen = []
+    for item in status_items:
+        stage = normalize_stage(item)
+        if stage and stage not in seen:
+            seen.append(stage)
+
+    last_seen = max((ORDERED_STAGES.index(stage) for stage in seen), default=-1)
+    if fallback_current:
+        current_stage = fallback_current
+    elif last_seen >= 0 and last_seen < len(ORDERED_STAGES) - 1:
+        current_stage = ORDERED_STAGES[last_seen + 1]
+    else:
+        current_stage = None
+
+    if current_stage:
+        label = f"Current: {current_stage.capitalize()}"
+    elif "result" in seen:
+        label = "Completed: Result generated"
+    else:
+        label = "Waiting for image"
+
+    items = []
+    for index, stage in enumerate(ORDERED_STAGES, start=1):
+        classes = ["pipeline-step"]
+        if stage in seen:
+            classes.append("done")
+        elif current_stage == stage:
+            classes.append("current")
+        items.append(
+            f"""
+            <li class="{' '.join(classes)}">
+              <span class="step-index">{index}</span>
+              <span class="step-label">{html.escape(stage.capitalize())}</span>
+            </li>
+            """
+        )
+
+    return f"""
+    <section class="pipeline-stage card">
+      <div class="pipeline-head">
+        <h2>Layer-wise Processing</h2>
+        <p class="pipeline-stage-label">{html.escape(label)}</p>
+      </div>
+      <ol class="pipeline-flow">
+        {''.join(items)}
+      </ol>
+    </section>
+    """
+
+
+def render_results_summary(result: Optional[Dict[str, object]], error_text: str, pipeline_status: List[str]) -> None:
+    recognized_text = html.escape(str(result["recognized_text"])) if result else ""
+    confidence = f"{float(result['confidence']):.2f}%" if result else "-"
+    segments = str(result["num_segments"]) if result else "-"
+    status_markup = "".join(f"<li>{html.escape(item)}</li>" for item in pipeline_status)
+    warning = html.escape(str(result.get("warning", ""))) if result and result.get("warning") else ""
+    overlay_uri = path_to_data_uri(result["segmented_overlay_image"]) if result else None
+    overlay_markup = f'<img src="{overlay_uri}" alt="Segmented overlay">' if overlay_uri else ""
+    overlay_empty_class = " empty" if overlay_uri is None else ""
+    final_error = html.escape(error_text or warning)
+
+    st.markdown(
+        f"""
+        <section class="shell shell-bottom results-card">
+          <div class="results-headline"><h2>Recognized Text</h2></div>
+          <div class="recognized tamil">{recognized_text}</div>
+          <div class="metrics">
+            <p><strong>Confidence:</strong> {confidence}</p>
+            <p><strong>Segments:</strong> {segments}</p>
+          </div>
+          <h3>Segmented Overlay</h3>
+          <div class="image-wrap{overlay_empty_class}">
+            {overlay_markup}
+          </div>
+          <h3>Pipeline Log</h3>
+          <ul class="status-list">{status_markup}</ul>
+          <p class="error-text">{final_error}</p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def reset_state() -> None:
+    st.session_state["ocr_result"] = None
+    st.session_state["pipeline_status"] = []
+    st.session_state["pipeline_note"] = ""
+    st.session_state["error_text"] = ""
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+
+
 def main() -> None:
     st.set_page_config(page_title="EpigraNet Tamil OCR", layout="wide")
-    st.title("EpigraNet Tamil OCR")
-    st.caption("Streamlit frontend for the existing OCR pipeline with optional Hugging Face Hub model assets.")
+    inject_theme()
+    st.session_state.setdefault("ocr_result", None)
+    st.session_state.setdefault("pipeline_status", [])
+    st.session_state.setdefault("pipeline_note", "")
+    st.session_state.setdefault("error_text", "")
+    st.session_state.setdefault("uploader_key", 0)
 
-    with st.sidebar:
-        st.subheader("Runtime")
-        settings = get_asset_settings()
-        source_label = settings["hf_repo_id"] or "Local project files"
-        st.write(f"Asset source: `{source_label}`")
-        if settings["hf_repo_id"]:
-            st.write(f"Revision: `{settings['hf_revision']}`")
-        st.write(f"Upload limit: `{MAX_FILE_SIZE_MB} MB`")
+    settings = get_asset_settings()
+    source_label = settings["hf_repo_id"] or "Local project files"
+
+    st.markdown(
+        """
+        <header class="topbar">
+          <div class="brand">
+            <div class="brand-icon">◎</div>
+            <h1>EpigraNet-Tamil - Tamil Epigraphical OCR</h1>
+          </div>
+          <div class="actions">History</div>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <section class="shell">
+          <div class="upload-copy">
+            <p class="drop-main">Drag &amp; Drop or Click to Upload Inscription Image</p>
+            <p class="drop-sub">(Max file size: {MAX_FILE_SIZE_MB} MB)</p>
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
     try:
         predictor = load_predictor(settings)
-        st.sidebar.success(
-            f"Model ready: `{predictor.model_arch}` with {len(predictor.reference_embeddings)} reference embeddings."
+        st.caption(
+            f"Asset source: {source_label} | Model: {predictor.model_arch} | Reference classes: {len(predictor.reference_embeddings)}"
         )
     except Exception as exc:
         st.error(f"Unable to initialize OCR predictor: {exc}")
@@ -196,53 +775,82 @@ def main() -> None:
         "Upload an inscription image",
         type=sorted(ALLOWED_EXTENSIONS),
         accept_multiple_files=False,
+        label_visibility="collapsed",
+        key=f"file_uploader_{st.session_state['uploader_key']}",
     )
 
-    if uploaded_file is None:
-        st.info("Upload a Tamil inscription image to run OCR.")
-        return
-
-    preview = Image.open(BytesIO(uploaded_file.getvalue()))
-    st.image(preview, caption="Uploaded image", use_container_width=True)
-
-    if st.button("Run OCR", type="primary"):
-        try:
-            with st.spinner("Running preprocessing, segmentation, and OCR..."):
-                result = run_ocr(uploaded_file)
-        except Exception as exc:
-            st.error(f"OCR failed: {exc}")
-            return
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Confidence", f"{result['confidence']:.2f}%")
-        col2.metric("Segments", int(result["num_segments"]))
-        col3.metric("Tokens", len(result["token_predictions"]))
-
-        st.subheader("Recognized Text")
-        st.text_area("OCR Output", value=str(result["recognized_text"]), height=120)
-
-        image_col1, image_col2, image_col3 = st.columns(3)
-        image_col1.image(str(result["original_image"]), caption="Original", use_container_width=True)
-        image_col2.image(str(result["preprocessed_image"]), caption="Preprocessed", use_container_width=True)
-        image_col3.image(
-            str(result["segmented_overlay_image"]),
-            caption="Segmentation Overlay",
-            use_container_width=True,
+    selected_file_name = uploaded_file.name if uploaded_file is not None else ""
+    if selected_file_name:
+        st.markdown(f'<p class="selected-file">Selected: {html.escape(selected_file_name)}</p>', unsafe_allow_html=True)
+    if st.session_state["pipeline_note"]:
+        st.markdown(
+            f'<p class="selected-file">{html.escape(st.session_state["pipeline_note"])}</p>',
+            unsafe_allow_html=True,
         )
 
-        st.subheader("Token Predictions")
-        st.dataframe(pd.DataFrame(result["token_predictions"]), use_container_width=True)
+    action_col1, action_col2 = st.columns(2)
+    run_clicked = action_col1.button("Run Prediction", type="primary", use_container_width=True)
+    clear_clicked = action_col2.button("Clear", use_container_width=True)
 
-        roi_paths: List[Path] = result["roi_paths"]  # type: ignore[assignment]
-        if roi_paths:
-            st.subheader("Character Segments")
-            roi_columns = st.columns(4)
-            for index, roi_path in enumerate(roi_paths):
-                with roi_columns[index % len(roi_columns)]:
-                    st.image(str(roi_path), caption=roi_path.name, use_container_width=True)
+    if clear_clicked:
+        reset_state()
+        st.rerun()
 
-        st.subheader("Exports")
-        render_downloads(result)
+    if run_clicked:
+        if uploaded_file is None:
+            st.session_state["error_text"] = "Please select an image."
+            st.session_state["pipeline_note"] = "Pipeline failed."
+            st.session_state["pipeline_status"] = []
+        else:
+            try:
+                st.session_state["error_text"] = ""
+                st.session_state["pipeline_note"] = "Processing image..."
+                with st.spinner("Running preprocessing, segmentation, and OCR..."):
+                    result = run_ocr(uploaded_file)
+                st.session_state["ocr_result"] = result
+                st.session_state["pipeline_status"] = result["pipeline_status"]
+                st.session_state["pipeline_note"] = "Pipeline completed."
+            except Exception as exc:
+                st.session_state["ocr_result"] = None
+                st.session_state["pipeline_status"] = []
+                st.session_state["pipeline_note"] = "Pipeline failed."
+                st.session_state["error_text"] = str(exc)
+
+    result = st.session_state["ocr_result"]
+    fallback_current = "preprocessing" if uploaded_file is not None and result is None else None
+    st.markdown(
+        build_pipeline_markup(st.session_state["pipeline_status"], fallback_current=fallback_current),
+        unsafe_allow_html=True,
+    )
+
+    original_uri = image_to_data_uri(Image.open(BytesIO(uploaded_file.getvalue()))) if uploaded_file else None
+    preprocessed_uri = path_to_data_uri(result["preprocessed_image"]) if result else None
+    overlay_uri = path_to_data_uri(result["segmented_overlay_image"]) if result else None
+
+    preview_cols = st.columns(3)
+    with preview_cols[0]:
+        render_preview_card("Original Inscription Image", original_uri, "Original image preview")
+    with preview_cols[1]:
+        render_preview_card("Preprocessed Inscription Image", preprocessed_uri, "Preprocessed image preview")
+    with preview_cols[2]:
+        render_preview_card("Segmentation Overlay", overlay_uri, "Segmentation overlay preview")
+
+    render_results_summary(result, st.session_state["error_text"], st.session_state["pipeline_status"])
+
+    if result:
+        export_col1, export_col2, export_col3 = st.columns(3)
+        with export_col1:
+            st.markdown("### Exports")
+            render_downloads(result)
+        with export_col2:
+            st.markdown("### Token Predictions")
+            st.dataframe(pd.DataFrame(result["token_predictions"]), use_container_width=True)
+        with export_col3:
+            roi_paths: List[Path] = result["roi_paths"]  # type: ignore[assignment]
+            if roi_paths:
+                st.markdown("### Character Segments")
+                for roi_path in roi_paths[:6]:
+                    render_preview_card(roi_path.name, path_to_data_uri(roi_path), roi_path.name)
 
 
 if __name__ == "__main__":
