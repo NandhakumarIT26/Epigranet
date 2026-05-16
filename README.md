@@ -87,15 +87,18 @@ pip install -r requirements.txt
 This project already includes:
 
 - `models/epigranet_embedding_model (1).pt`
+- `models/reference_embeddings.pt`
 - `class_mapping_209 (1).json`
 
-The app also expects a reference dataset directory used to build embeddings for each class. By default it looks for:
+With `models/reference_embeddings.pt` present, the app can run without the training/reference dataset folder.
+
+The dataset directory is only needed if you want to rebuild the reference embeddings cache. By default the optional dataset path is:
 
 ```text
 aug_dataset
 ```
 
-That folder is not currently present in this repository, so before running the app you should do one of the following:
+If `models/reference_embeddings.pt` is missing, then before running the app you should do one of the following:
 
 1. Add an `aug_dataset/` folder at the project root.
 2. Set `EPIGRANET_DATASET_PATH` to the location of your dataset.
@@ -110,6 +113,35 @@ You can override the default asset paths with environment variables:
 $env:EPIGRANET_MODEL_PATH="C:\path\to\epigranet_embedding_model (1).pt"
 $env:EPIGRANET_DATASET_PATH="C:\path\to\aug_dataset"
 $env:EPIGRANET_CLASS_MAPPING_PATH="C:\path\to\class_mapping_209 (1).json"
+```
+
+`EPIGRANET_DATASET_PATH` is optional when `models/reference_embeddings.pt` is available.
+
+### Model architecture
+
+The runtime now supports two model architectures:
+
+- `resnet18`
+- `tiny_cnn`
+
+By default, the app uses:
+
+```text
+EPIGRANET_MODEL_ARCH=auto
+```
+
+That means it inspects the saved checkpoint and automatically picks the matching architecture.
+
+Important:
+
+- The current bundled model file was trained for `resnet18`.
+- Switching to `tiny_cnn` requires a new checkpoint trained for `tiny_cnn`.
+- The reference embeddings cache must be rebuilt using the same model architecture as the checkpoint.
+
+If you later train a lightweight model, you can deploy it with:
+
+```powershell
+$env:EPIGRANET_MODEL_ARCH="tiny_cnn"
 ```
 
 ## Run the Application
@@ -198,9 +230,60 @@ During each run, the app stores intermediate and final artifacts under `static/g
 
 - Live app: [https://epigranet.onrender.com/](https://epigranet.onrender.com/)
 
+### Deploy on Any Cloud with Docker
+
+This repository now includes a `Dockerfile`, which is the simplest way to deploy the app to most cloud providers such as Render, Railway, Fly.io, Azure Web App for Containers, Google Cloud Run, or any VPS with Docker.
+
+The container includes only the files needed at runtime:
+
+- `app.py`
+- `pipeline.py`
+- `templates/`
+- `static/`
+- `models/`
+- `class_mapping_209 (1).json`
+
+It intentionally does **not** include `aug_dataset/`, because runtime inference can use `models/reference_embeddings.pt` directly.
+
+### Build locally
+
+```bash
+docker build -t epigranet .
+```
+
+### Run locally
+
+```bash
+docker run -p 10000:10000 epigranet
+```
+
+Then open:
+
+```text
+http://127.0.0.1:10000
+```
+
+### Cloud start behavior
+
+The container starts with:
+
+```bash
+gunicorn app:app -c gunicorn.conf.py
+```
+
+The app binds to the cloud-provided `PORT` automatically.
+
+### Recommended deployment notes
+
+- Use a Docker-based web service.
+- Keep `WEB_CONCURRENCY=1` to reduce memory usage.
+- Choose an instance with enough RAM for PyTorch inference.
+- If a provider offers only `512 MB` RAM, the homepage may work, but prediction requests can still run out of memory.
+- For the lowest memory usage, train and deploy a `tiny_cnn` checkpoint plus matching reference embeddings.
+
 ## Notes and Limitations
 
-- Prediction depends on the availability and quality of the reference dataset.
+- Prediction depends on the quality of the reference embeddings cache or dataset.
 - The model performs nearest-reference matching using cosine similarity on learned embeddings.
 - If segmentation fails, the app falls back to predicting from the full preprocessed image.
 - `preprocess.py`, `segmentation.py`, and `test.py` appear to be standalone experimentation scripts, while `app.py` and `pipeline.py` drive the main application flow.

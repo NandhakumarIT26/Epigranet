@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+runtime_generated/
+aug_dataset/
+test.py
+preprocess.py
+segmentation.py
+README.md
+WhatsApp Image 2026-03-14 at 8.38.07 PM.jpeg

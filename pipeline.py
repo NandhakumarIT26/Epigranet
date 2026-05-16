@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -17,13 +18,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torchvision import models, transforms
 
 
 IMAGE_SIZE = 64
 EMBED_DIM = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 REFERENCE_EMBEDDING_VERSION = 1
+DEFAULT_MODEL_ARCH = os.environ.get("EPIGRANET_MODEL_ARCH", "auto").strip().lower() or "auto"
 
 try:
     torch.set_num_threads(int(os.environ.get("EPIGRANET_TORCH_THREADS", "1")))
@@ -209,15 +210,108 @@ def segment_characters(
     return rois
 
 
-class EmbeddingNet(nn.Module):
+class ResNet18EmbeddingNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        from torchvision import models
+
         self.backbone = models.resnet18(weights=None)
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, EMBED_DIM)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.backbone(x)
         return F.normalize(x, p=2, dim=1)
+
+
+class TinyEmbeddingNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.head = nn.Linear(96, EMBED_DIM)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        x = self.head(x)
+        return F.normalize(x, p=2, dim=1)
+
+
+def build_model(arch: str) -> nn.Module:
+    arch = arch.strip().lower()
+    if arch == "resnet18":
+        return ResNet18EmbeddingNet()
+    if arch == "tiny_cnn":
+        return TinyEmbeddingNet()
+    raise ValueError(f"Unsupported model architecture: {arch}")
+
+
+def infer_architecture_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> str:
+    keys = set(state_dict.keys())
+    if any(key.startswith("backbone.layer") or key.startswith("backbone.conv1") for key in keys):
+        return "resnet18"
+    if any(key.startswith("features.") or key.startswith("head.") for key in keys):
+        return "tiny_cnn"
+    raise ValueError(
+        "Unable to infer model architecture from checkpoint keys. "
+        "Set EPIGRANET_MODEL_ARCH or save checkpoints with {'arch': ..., 'state_dict': ...}."
+    )
+
+
+def load_checkpoint_payload(model_path: Path) -> Tuple[str, Dict[str, torch.Tensor]]:
+    payload = torch.load(str(model_path), map_location=DEVICE)
+
+    if isinstance(payload, OrderedDict):
+        state_dict = dict(payload)
+        return infer_architecture_from_state_dict(state_dict), state_dict
+
+    if isinstance(payload, dict) and "state_dict" in payload:
+        raw_state_dict = payload["state_dict"]
+        if not isinstance(raw_state_dict, (dict, OrderedDict)):
+            raise ValueError("Checkpoint 'state_dict' must be a dictionary of tensors.")
+        state_dict = dict(raw_state_dict)
+        arch = str(payload.get("arch") or infer_architecture_from_state_dict(state_dict)).strip().lower()
+        return arch, state_dict
+
+    if isinstance(payload, dict):
+        state_dict = dict(payload)
+        return infer_architecture_from_state_dict(state_dict), state_dict
+
+    raise ValueError("Unsupported checkpoint format.")
+
+
+def prepare_image_tensor(image_path: Path, channels: int) -> torch.Tensor:
+    img = Image.open(image_path)
+    if channels == 1:
+        img = img.convert("L")
+    else:
+        img = img.convert("RGB")
+
+    resized = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.BILINEAR)
+    arr = np.asarray(resized, dtype=np.float32) / 255.0
+
+    if channels == 1:
+        arr = np.expand_dims(arr, axis=0)
+    else:
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        arr = np.transpose(arr, (2, 0, 1))
+
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+    return tensor.to(DEVICE)
 
 
 @dataclass
@@ -239,14 +333,9 @@ class OCRPredictor:
         self.dataset_path = dataset_path
         self.class_mapping_path = class_mapping_path
         self.embedding_cache_path = embedding_cache_path
-        self.model = EmbeddingNet().to(DEVICE)
-        self.transform = transforms.Compose(
-            [
-                transforms.Grayscale(num_output_channels=3),
-                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-                transforms.ToTensor(),
-            ]
-        )
+        self.model_arch = DEFAULT_MODEL_ARCH
+        self.input_channels = 3
+        self.model: Optional[nn.Module] = None
         self.reference_embeddings: Dict[str, torch.Tensor] = {}
         self.class_mapping: Dict[str, str] = {}
         self._load()
@@ -255,7 +344,17 @@ class OCRPredictor:
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
 
-        state_dict = torch.load(str(self.model_path), map_location=DEVICE)
+        checkpoint_arch, state_dict = load_checkpoint_payload(self.model_path)
+        if self.model_arch == "auto":
+            self.model_arch = checkpoint_arch
+        elif self.model_arch != checkpoint_arch:
+            raise ValueError(
+                f"Configured model architecture '{self.model_arch}' does not match checkpoint architecture "
+                f"'{checkpoint_arch}'."
+            )
+
+        self.model = build_model(self.model_arch).to(DEVICE)
+        self.input_channels = 1 if self.model_arch == "tiny_cnn" else 3
         self.model.load_state_dict(state_dict)
         self.model.eval()
         self.class_mapping = self._load_class_mapping()
@@ -342,8 +441,9 @@ class OCRPredictor:
         return self.class_mapping.get(label, label)
 
     def _embed_image(self, image_path: Path) -> torch.Tensor:
-        img = Image.open(image_path).convert("RGB")
-        tensor = self.transform(img).unsqueeze(0).to(DEVICE)
+        if self.model is None:
+            raise RuntimeError("Model has not been loaded.")
+        tensor = prepare_image_tensor(image_path, self.input_channels)
         with torch.inference_mode():
             emb = self.model(tensor)
         return emb
