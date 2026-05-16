@@ -1,22 +1,24 @@
 import os
 import threading
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 
-from pipeline import (
-    OCRPredictor,
-    create_run_id,
-    ensure_dir,
-    preprocess_image,
-    segment_characters,
-)
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def create_run_id() -> str:
+    return uuid.uuid4().hex[:12]
 
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-GENERATED_DIR = ensure_dir(Path(os.environ.get("EPIGRANET_GENERATED_DIR", BASE_DIR / "runtime_generated")))
+GENERATED_DIR = Path(os.environ.get("EPIGRANET_GENERATED_DIR", BASE_DIR / "runtime_generated"))
 UPLOAD_DIR = ensure_dir(GENERATED_DIR / "uploads")
 PREPROCESSED_DIR = ensure_dir(GENERATED_DIR / "preprocessed")
 SEGMENT_DIR = ensure_dir(GENERATED_DIR / "segments")
@@ -40,9 +42,23 @@ _predictor = None
 _predictor_lock = threading.Lock()
 _predictor_warmup_started = False
 _predictor_warmup_error = None
+_pipeline_api = None
 
 
-def get_predictor() -> OCRPredictor:
+def get_pipeline_api():
+    global _pipeline_api
+    if _pipeline_api is None:
+        from pipeline import OCRPredictor, preprocess_image, segment_characters
+
+        _pipeline_api = {
+            "OCRPredictor": OCRPredictor,
+            "preprocess_image": preprocess_image,
+            "segment_characters": segment_characters,
+        }
+    return _pipeline_api
+
+
+def get_predictor():
     global _predictor, _predictor_warmup_error
     if _predictor is not None:
         return _predictor
@@ -54,7 +70,8 @@ def get_predictor() -> OCRPredictor:
             raise RuntimeError(f"Predictor warmup failed: {_predictor_warmup_error}")
 
         try:
-            _predictor = OCRPredictor(
+            pipeline_api = get_pipeline_api()
+            _predictor = pipeline_api["OCRPredictor"](
                 model_path=MODEL_PATH,
                 class_mapping_path=CLASS_MAPPING_PATH,
                 embedding_cache_path=EMBEDDINGS_PATH,
@@ -94,7 +111,6 @@ def to_generated_url(path: Path) -> str:
 
 @app.route("/")
 def index():
-    start_predictor_warmup()
     return render_template("index.html", max_size_mb=MAX_FILE_SIZE_MB)
 
 
@@ -105,6 +121,8 @@ def file_too_large(_error):
 
 @app.route("/api/predict", methods=["POST"])
 def predict():
+    pipeline_api = get_pipeline_api()
+
     if "image" not in request.files:
         return jsonify({"error": "No image file provided."}), 400
 
@@ -133,13 +151,13 @@ def predict():
     warning = None
 
     try:
-        preprocess_image(upload_path, preprocessed_path)
+        pipeline_api["preprocess_image"](upload_path, preprocessed_path)
         pipeline_status.append("Preprocessing completed.")
     except Exception as exc:
         return jsonify({"error": f"Preprocessing failed: {exc}"}), 500
 
     try:
-        roi_paths = segment_characters(preprocessed_path, roi_dir, boxed_path)
+        roi_paths = pipeline_api["segment_characters"](preprocessed_path, roi_dir, boxed_path)
         num_segments = len(roi_paths)
         if not boxed_path.exists():
             boxed_path = preprocessed_path
@@ -182,9 +200,5 @@ def predict():
 def generated(filename: str):
     return send_from_directory(GENERATED_DIR, filename)
 
-
-start_predictor_warmup()
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
